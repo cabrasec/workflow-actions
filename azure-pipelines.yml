@@ -1,0 +1,218 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - feature/*
+      - release
+      - main
+  paths:
+    include:
+      - policies/**/*.json
+      - terraform/**/*.tf
+      - terragrunt/**/*.hcl
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - policies/**
+
+variables:
+  - group: "azure-policy-variables"
+  - name: terraformVersion
+    value: "1.6.0"
+  - name: terragruntVersion
+    value: "0.54.0"
+  - name: workingDirectory
+    value: "$(System.DefaultWorkingDirectory)"
+
+stages:
+  # STAGE 1: VALIDAÇÃO (executa em todas as branches)
+  - stage: Validate
+    displayName: "Validação de Código"
+    jobs:
+      - job: Validate_Code
+        displayName: "Validar Azure Policies e Terraform"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+            persistCredentials: "true"
+
+          # Instalar ferramentas
+          - script: |
+              wget https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+              unzip terraform_$(terraformVersion)_linux_amd64.zip
+              sudo mv terraform /usr/local/bin/
+              terraform version
+            displayName: "Instalar Terraform"
+
+          - script: |
+              wget https://github.com/gruntwork-io/terragrunt/releases/download/v$(terragruntVersion)/terragrunt_linux_amd64
+              chmod +x terragrunt_linux_amd64
+              sudo mv terragrunt_linux_amd64 /usr/local/bin/terragrunt
+              terragrunt --version
+            displayName: "Instalar Terragrunt"
+
+          - task: Bash@3
+            displayName: "Validar JSON das Policies"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "🔍 Validando JSON das policies..."
+                find ./policies -name "*.json" -type f | while read file; do
+                  echo "Validando: $file"
+                  if jq . "$file" > /dev/null 2>&1; then
+                    echo "✅ $file - JSON válido"
+                  else
+                    echo "❌ $file - JSON inválido"
+                    exit 1
+                  fi
+                done
+
+          - task: Bash@3
+            displayName: "Validar Terraform Syntax"
+            inputs:
+              targetType: "inline"
+              script: |
+                cd terraform
+                terraform init -backend=false
+                terraform validate
+
+          - task: Bash@3
+            displayName: "Validar Terragrunt"
+            inputs:
+              targetType: "inline"
+              script: |
+                cd terragrunt
+                terragrunt validate-all --terragrunt-non-interactive
+
+  # STAGE 2: DEPLOY DEV (apenas feature branches)
+  - stage: Deploy_Dev
+    displayName: "Deploy para Dev"
+    dependsOn: Validate
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/heads/feature/'))
+
+    jobs:
+      - deployment: Deploy_Dev_Policies
+        displayName: "Aplicar Policies - Dev"
+        environment: "dev"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: "Deploy Azure Policies - Dev"
+                  inputs:
+                    azureSubscription: "$(azureServiceConnection)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      echo "🚀 Aplicando Azure Policies no ambiente DEV..."
+                      echo "Branch: $(Build.SourceBranch)"
+
+                      # Deploy usando Terragrunt
+                      cd terragrunt/dev
+                      terragrunt run-all apply --terragrunt-non-interactive -auto-approve
+
+                      echo "✅ Policies aplicadas com sucesso em DEV"
+
+  # STAGE 3: DEPLOY HOM (apenas release branch)
+  - stage: Deploy_Hom
+    displayName: "Deploy para Homologação"
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/release'))
+
+    jobs:
+      - deployment: Deploy_Hom_Policies
+        displayName: "Aplicar Policies - Hom"
+        environment: "hom"
+        pool:
+          vmImage: "ubuntu-latest"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: "Deploy Azure Policies - Hom"
+                  inputs:
+                    azureSubscription: "$(azureServiceConnection)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      echo "🚀 Aplicando Azure Policies no ambiente HOM..."
+                      echo "Branch: $(Build.SourceBranch)"
+
+                      # Deploy usando Terragrunt
+                      cd terragrunt/hom
+                      terragrunt run-all apply --terragrunt-non-interactive -auto-approve
+
+                      echo "✅ Policies aplicadas com sucesso em HOM"
+
+  # STAGE 4: VALIDAÇÃO PARA PR (apenas main - gatilho para PR)
+  - stage: Pre_Prod_Validation
+    displayName: "Validação para Produção"
+    dependsOn: Validate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - job: Validate_Prod
+        displayName: "Validação Final para PR"
+        pool:
+          vmImage: "ubuntu-latest"
+
+        steps:
+          - checkout: self
+
+          - task: Bash@3
+            displayName: "Simular Deploy Produção (Dry Run)"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "🧪 Simulando deploy em produção..."
+                cd terragrunt/prod
+                terragrunt run-all plan --terragrunt-non-interactive
+
+                echo "✅ Validação concluída - PR pode ser aprovado"
+
+          - task: Bash@3
+            displayName: "Gerar Resumo do PR"
+            inputs:
+              targetType: "inline"
+              script: |
+                echo "## 📋 Resumo das Policies para Produção" > pr-summary.md
+                echo "### Build: $(Build.BuildNumber)" >> pr-summary.md
+                echo "### Policies a serem aplicadas:" >> pr-summary.md
+
+                for policy_file in ./policies/*.json; do
+                  if [ -f "$policy_file" ]; then
+                    policy_name=$(basename "$policy_file" .json)
+                    display_name=$(jq -r '.properties.displayName // "Sem nome"' "$policy_file")
+                    description=$(jq -r '.properties.description // "Sem descrição"' "$policy_file")
+                    echo "---" >> pr-summary.md
+                    echo "**Policy:** $policy_name" >> pr-summary.md
+                    echo "**Nome:** $display_name" >> pr-summary.md
+                    echo "**Descrição:** $description" >> pr-summary.md
+                  fi
+                done
+
+                echo "---" >> pr-summary.md
+                echo "✅ **STATUS:** Validação concluída com sucesso" >> pr-summary.md
+
+                cat pr-summary.md
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Publicar Resumo do PR"
+            inputs:
+              PathtoPublish: "pr-summary.md"
+              ArtifactName: "pr-summary"
